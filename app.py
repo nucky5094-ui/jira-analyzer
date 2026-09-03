@@ -13,7 +13,7 @@ import streamlit as st
 st.set_page_config(
     page_title="Jira Cycle Time Analyzer",
     page_icon="📊",
-layout="wide",
+    layout="wide",
 )
 import io
 
