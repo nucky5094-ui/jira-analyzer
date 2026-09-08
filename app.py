@@ -1,20 +1,11 @@
-import csv
-import io
-
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-import streamlit as st
-
-
 st.set_page_config(
-    page_title="Jira Cycle Time Analyzer",
+    page_title="Jira Flow Analyzer",
     page_icon="📊",
     layout="wide",
 )
 
 
-REQUIRED_COLUMNS = {"Issue Type", "Created", "Resolved"}
+LEAD_TIME_REQUIRED_COLUMNS = {"Created", "Resolved"}
 
 
 def read_csv_file(uploaded_file):
@@ -52,17 +43,19 @@ def read_csv_file(uploaded_file):
 
 def parse_jira_dates(series):
     """Преобразует даты Jira в datetime."""
+    cleaned = series.replace(r"^\s*$", np.nan, regex=True)
+
     result = pd.to_datetime(
-        series,
+        cleaned,
         format="%d/%m/%y %H:%M",
         errors="coerce",
     )
 
-    missing_mask = result.isna() & series.notna()
+    missing_mask = result.isna() & cleaned.notna()
 
     if missing_mask.any():
         fallback = pd.to_datetime(
-            series.loc[missing_mask],
+            cleaned.loc[missing_mask],
             dayfirst=True,
             errors="coerce",
         )
@@ -71,75 +64,110 @@ def parse_jira_dates(series):
     return result
 
 
-def prepare_data(dataframe):
-    """Проверяет данные и рассчитывает количество дней до закрытия."""
-    missing_columns = REQUIRED_COLUMNS - set(dataframe.columns)
+def add_problem(problem_lists, mask, text):
+    """Добавляет описание проблемы всем строкам, попавшим под mask."""
+    for idx in problem_lists.index[mask]:
+        problem_lists.at[idx].append(text)
 
-    if missing_columns:
-        missing_text = ", ".join(sorted(missing_columns))
-        raise ValueError(
-            f"В CSV отсутствуют обязательные колонки: {missing_text}"
-        )
 
+def prepare_lead_time_data(dataframe):
+    """
+    Готовит данные для Lead Time и отдельно сохраняет строки,
+    которые нельзя использовать в этой метрике.
+    """
     data = dataframe.copy()
 
-    data["Issue Type"] = (
-        data["Issue Type"]
-        .fillna("Без типа")
-        .astype(str)
-        .str.strip()
-    )
+    missing_columns = LEAD_TIME_REQUIRED_COLUMNS - set(data.columns)
+    if missing_columns:
+        return {
+            "available": False,
+            "missing_columns": sorted(missing_columns),
+            "all_data": data,
+            "valid_data": pd.DataFrame(),
+            "excluded_data": pd.DataFrame(),
+        }
 
     data["_Created"] = parse_jira_dates(data["Created"])
     data["_Resolved"] = parse_jira_dates(data["Resolved"])
 
-    invalid_date_mask = data["_Created"].isna() | data["_Resolved"].isna()
-    invalid_date_count = int(invalid_date_mask.sum())
+    problem_lists = pd.Series(
+        [[] for _ in range(len(data))],
+        index=data.index,
+        dtype=object,
+    )
 
-    delta_seconds = (
-        data["_Resolved"] - data["_Created"]
-    ).dt.total_seconds()
+    created_raw = data["Created"].replace(r"^\s*$", np.nan, regex=True)
+    resolved_raw = data["Resolved"].replace(r"^\s*$", np.nan, regex=True)
 
-    negative_mask = delta_seconds < 0
-    negative_count = int(negative_mask.fillna(False).sum())
+    created_empty = created_raw.isna()
+    resolved_empty = resolved_raw.isna()
+    created_invalid = created_raw.notna() & data["_Created"].isna()
+    resolved_invalid = resolved_raw.notna() & data["_Resolved"].isna()
 
-    valid_mask = (~invalid_date_mask) & (~negative_mask.fillna(False))
-    data = data.loc[valid_mask].copy()
+    add_problem(problem_lists, created_empty, "Не заполнено поле Created")
+    add_problem(problem_lists, resolved_empty, "Не заполнено поле Resolved")
+    add_problem(problem_lists, created_invalid, "Некорректная дата Created")
+    add_problem(problem_lists, resolved_invalid, "Некорректная дата Resolved")
 
-    delta_seconds = (
-        data["_Resolved"] - data["_Created"]
-    ).dt.total_seconds()
+    negative_mask = (
+        data["_Created"].notna()
+        & data["_Resolved"].notna()
+        & (data["_Resolved"] < data["_Created"])
+    )
+    add_problem(problem_lists, negative_mask, "Resolved раньше Created")
 
-    data["Days to Resolve"] = np.floor(
-        delta_seconds / 86400
-    ).astype(int)
+    if "Issue Type" in data.columns:
+        issue_type_raw = data["Issue Type"].replace(r"^\s*$", np.nan, regex=True)
+        issue_type_missing = issue_type_raw.isna()
+        add_problem(problem_lists, issue_type_missing, "Не заполнено поле Issue Type")
 
-    return data, invalid_date_count, negative_count
+        data["Issue Type"] = issue_type_raw.astype("string").str.strip()
+
+    data["Проблемы данных"] = problem_lists.apply(lambda items: "; ".join(items))
+
+    valid_mask = data["Проблемы данных"].eq("")
+    valid_data = data.loc[valid_mask].copy()
+    excluded_data = data.loc[~valid_mask].copy()
+
+    if not valid_data.empty:
+        delta_seconds = (
+            valid_data["_Resolved"] - valid_data["_Created"]
+        ).dt.total_seconds()
+
+        valid_data["Lead Time Days"] = np.floor(
+            delta_seconds / 86400
+        ).astype(int)
+
+    return {
+        "available": True,
+        "missing_columns": [],
+        "all_data": data,
+        "valid_data": valid_data,
+        "excluded_data": excluded_data,
+    }
 
 
 def build_frequency_table(filtered_data, day_limit=None):
-    """Строит частотную таблицу и формирует текущую выборку."""
+    """Строит частотную таблицу Lead Time и текущую выборку."""
     total_tasks = len(filtered_data)
 
     if day_limit is None:
         visible_data = filtered_data.copy()
     else:
         visible_data = filtered_data[
-            filtered_data["Days to Resolve"] <= day_limit
+            filtered_data["Lead Time Days"] <= day_limit
         ].copy()
 
     frequency = (
         visible_data
-        .groupby("Days to Resolve")
+        .groupby("Lead Time Days")
         .size()
         .reset_index(name="Количество задач")
-        .sort_values("Days to Resolve")
+        .sort_values("Lead Time Days")
     )
 
     if total_tasks > 0 and not frequency.empty:
-        frequency["Доля"] = (
-            frequency["Количество задач"] / total_tasks * 100
-        )
+        frequency["Доля"] = frequency["Количество задач"] / total_tasks * 100
     else:
         frequency["Доля"] = pd.Series(dtype=float)
 
@@ -147,13 +175,13 @@ def build_frequency_table(filtered_data, day_limit=None):
 
 
 def build_chart(frequency):
-    """Создаёт интерактивную частотную диаграмму."""
+    """Создаёт интерактивную частотную диаграмму Lead Time."""
     chart_data = frequency.copy()
-    chart_data["День"] = chart_data["Days to Resolve"].astype(str)
+    chart_data["День"] = chart_data["Lead Time Days"].astype(str)
 
     custom_data = np.column_stack(
         (
-            chart_data["Days to Resolve"],
+            chart_data["Lead Time Days"],
             chart_data["Доля"],
         )
     )
@@ -166,7 +194,7 @@ def build_chart(frequency):
             y=chart_data["Количество задач"],
             customdata=custom_data,
             hovertemplate=(
-                "Дней до закрытия: %{customdata[0]:.0f}"
+                "Lead Time: %{customdata[0]:.0f} дн."
                 "<br>Количество задач: %{y}"
                 "<br>Доля среди выбранных задач: %{customdata[1]:.1f}%"
                 "<extra></extra>"
@@ -177,11 +205,11 @@ def build_chart(frequency):
 
     fig.update_layout(
         title={
-            "text": "Распределение задач по времени закрытия",
+            "text": "Распределение Lead Time",
             "x": 0.01,
             "xanchor": "left",
         },
-        xaxis_title="Количество дней до закрытия",
+        xaxis_title="Lead Time, полных календарных суток",
         yaxis_title="Количество задач",
         hovermode="closest",
         bargap=0.12,
@@ -195,19 +223,13 @@ def build_chart(frequency):
         categoryarray=chart_data["День"].tolist(),
     )
 
-    fig.update_yaxes(
-        rangemode="tozero",
-        dtick=1,
-    )
+    fig.update_yaxes(rangemode="tozero", dtick=1)
 
     return fig
 
 
 def build_task_table(visible_data):
-    """
-    Формирует список задач, попавших в текущий фильтр и диапазон.
-    Необязательные поля показываются только если они есть в CSV.
-    """
+    """Формирует список задач, вошедших в расчёт Lead Time."""
     table = visible_data.copy()
 
     table["Created_display"] = table["_Created"].dt.strftime("%d.%m.%Y %H:%M")
@@ -232,20 +254,19 @@ def build_task_table(visible_data):
     columns.extend([
         "Created_display",
         "Resolved_display",
-        "Days to Resolve",
+        "Lead Time Days",
     ])
 
     rename_map.update({
         "Created_display": "Создана",
         "Resolved_display": "Закрыта",
-        "Days to Resolve": "Дней до закрытия",
+        "Lead Time Days": "Lead Time, дней",
     })
 
     table = table[columns].rename(columns=rename_map)
 
-    # Самые долгие задачи сверху.
     table = table.sort_values(
-        by="Дней до закрытия",
+        by="Lead Time, дней",
         ascending=False,
         kind="stable",
     ).reset_index(drop=True)
@@ -253,11 +274,36 @@ def build_task_table(visible_data):
     return table
 
 
-st.title("Jira Cycle Time Analyzer")
+def build_excluded_table(excluded_data):
+    """Формирует список задач, исключённых из расчёта Lead Time."""
+    table = excluded_data.copy()
+
+    columns = []
+    rename_map = {}
+
+    optional_columns = [
+        ("Issue key", "Ключ"),
+        ("Summary", "Название"),
+        ("Issue Type", "Тип"),
+        ("Status", "Статус"),
+        ("Assignee", "Исполнитель"),
+        ("Created", "Created"),
+        ("Resolved", "Resolved"),
+        ("Проблемы данных", "Почему исключена"),
+    ]
+
+    for source_name, display_name in optional_columns:
+        if source_name in table.columns:
+            columns.append(source_name)
+            rename_map[source_name] = display_name
+
+    return table[columns].rename(columns=rename_map).reset_index(drop=True)
+
+
+st.title("Jira Flow Analyzer")
 st.write(
-    "Загрузите CSV-выгрузку из Jira. "
-    "Приложение рассчитает время от **Created** до **Resolved** "
-    "и покажет частотное распределение по полным календарным суткам."
+    "Загрузите CSV-выгрузку из Jira. На первом этапе приложение проверяет "
+    "качество данных и рассчитывает **Lead Time** от Created до Resolved."
 )
 
 uploaded_file = st.file_uploader(
@@ -271,194 +317,279 @@ if uploaded_file is None:
 
 
 try:
-    source_df, detected_separator, detected_encoding = read_csv_file(
-        uploaded_file
-    )
-    data, invalid_date_count, negative_count = prepare_data(source_df)
+    source_df, detected_separator, detected_encoding = read_csv_file(uploaded_file)
+    lead_time_result = prepare_lead_time_data(source_df)
 
 except Exception as error:
     st.error(f"Не удалось обработать файл: {error}")
     st.stop()
 
 
-if data.empty:
-    st.error(
-        "После проверки дат не осталось задач, которые можно анализировать."
+# -----------------------------
+# Доступность метрик
+# -----------------------------
+st.subheader("Доступность метрик")
+
+if lead_time_result["available"]:
+    st.success("Lead Time: доступен")
+else:
+    missing_text = ", ".join(lead_time_result["missing_columns"])
+    st.warning(
+        "Lead Time: недоступен. "
+        f"В файле отсутствуют колонки: {missing_text}."
     )
+
+st.info(
+    "Cycle Time: пока недоступен. Для корректного расчёта нужна дата первого "
+    "перехода задачи в разработку. Обычная выгрузка без истории переходов "
+    "этого не содержит."
+)
+
+st.info(
+    "Time in Status и Blocked Time: пока недоступны. Для них нужна история "
+    "переходов Jira."
+)
+
+if not lead_time_result["available"]:
+    with st.expander("Информация о загруженном файле"):
+        st.write(f"Строк в исходном файле: {len(source_df)}")
+        st.write(f"Определённый разделитель CSV: `{detected_separator}`")
+        st.write(f"Определённая кодировка: `{detected_encoding}`")
+        st.write("Колонки в файле:")
+        st.write(list(source_df.columns))
     st.stop()
 
 
-if invalid_date_count > 0:
+data = lead_time_result["valid_data"]
+excluded_data = lead_time_result["excluded_data"]
+
+
+# -----------------------------
+# Качество данных
+# -----------------------------
+st.subheader("Качество данных для Lead Time")
+
+source_count = len(source_df)
+valid_count = len(data)
+excluded_count = len(excluded_data)
+quality_percent = (valid_count / source_count * 100) if source_count else 0
+
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Всего строк", source_count)
+col2.metric("Участвуют в расчёте", valid_count)
+col3.metric("Исключены", excluded_count)
+col4.metric("Качество данных", f"{quality_percent:.1f}%")
+
+if excluded_count > 0:
     st.warning(
-        f"Не учтено строк с пустыми или некорректными датами: "
-        f"{invalid_date_count}."
+        f"Из расчёта Lead Time исключено задач: {excluded_count}. "
+        "Они не участвуют в графике и показаны отдельно ниже."
     )
 
-if negative_count > 0:
-    st.warning(
-        f"Не учтено строк, где Resolved раньше Created: "
-        f"{negative_count}."
+    problem_counts = (
+        excluded_data["Проблемы данных"]
+        .str.split("; ")
+        .explode()
+        .value_counts()
+        .rename_axis("Проблема")
+        .reset_index(name="Количество")
     )
 
-
-issue_types = sorted(data["Issue Type"].unique().tolist())
-
-selected_types = st.multiselect(
-    "Тип задачи",
-    options=issue_types,
-    default=issue_types,
-    help="Можно выбрать один, несколько или все типы задач.",
-)
-
-if not selected_types:
-    st.info("Выберите хотя бы один тип задачи.")
-    st.stop()
-
-
-filtered_data = data[
-    data["Issue Type"].isin(selected_types)
-].copy()
-
-
-display_option = st.radio(
-    "Диапазон отображения",
-    options=[
-        "До 30 дней",
-        "До 90 дней",
-        "Все задачи",
-    ],
-    index=0,
-    horizontal=True,
-    help=(
-        "Диапазон меняет и диаграмму, и список задач под ней."
-    ),
-)
-
-day_limit_map = {
-    "До 30 дней": 30,
-    "До 90 дней": 90,
-    "Все задачи": None,
-}
-
-day_limit = day_limit_map[display_option]
-
-frequency, visible_data = build_frequency_table(
-    filtered_data,
-    day_limit=day_limit,
-)
-
-if frequency.empty:
-    st.warning(
-        "Для выбранных типов задач и диапазона нет данных для отображения."
-    )
-    st.stop()
-
-
-total_tasks = len(filtered_data)
-visible_tasks = len(visible_data)
-hidden_tasks = total_tasks - visible_tasks
-
-if hidden_tasks > 0:
-    st.caption(
-        f"Выбрано задач: {total_tasks}. "
-        f"На диаграмме и в списке показано: {visible_tasks}. "
-        f"За пределами выбранного диапазона: {hidden_tasks}."
+    st.dataframe(
+        problem_counts,
+        use_container_width=True,
+        hide_index=True,
     )
 else:
+    st.success("Для расчёта Lead Time проблем с обязательными данными не найдено.")
+
+
+if data.empty:
+    st.error(
+        "В файле нет задач с достаточными и корректными данными для расчёта Lead Time."
+    )
+else:
+    # -----------------------------
+    # Фильтр по типу задачи
+    # -----------------------------
+    if "Issue Type" in data.columns:
+        issue_types = sorted(data["Issue Type"].dropna().astype(str).unique().tolist())
+
+        selected_types = st.multiselect(
+            "Тип задачи",
+            options=issue_types,
+            default=issue_types,
+            help="Можно выбрать один, несколько или все типы задач.",
+        )
+
+        if not selected_types:
+            st.info("Выберите хотя бы один тип задачи.")
+            st.stop()
+
+        filtered_data = data[data["Issue Type"].astype(str).isin(selected_types)].copy()
+    else:
+        st.warning(
+            "В файле нет колонки Issue Type. Lead Time будет рассчитан, "
+            "но фильтр по типу задачи недоступен."
+        )
+        filtered_data = data.copy()
+
+    display_option = st.radio(
+        "Диапазон отображения",
+        options=["До 30 дней", "До 90 дней", "Все задачи"],
+        index=0,
+        horizontal=True,
+        help="Диапазон меняет и диаграмму, и список задач под ней.",
+    )
+
+    day_limit_map = {
+        "До 30 дней": 30,
+        "До 90 дней": 90,
+        "Все задачи": None,
+    }
+
+    day_limit = day_limit_map[display_option]
+
+    frequency, visible_data = build_frequency_table(
+        filtered_data,
+        day_limit=day_limit,
+    )
+
+    if frequency.empty:
+        st.warning(
+            "Для выбранных типов задач и диапазона нет данных для отображения."
+        )
+    else:
+        total_tasks = len(filtered_data)
+        visible_tasks = len(visible_data)
+        hidden_tasks = total_tasks - visible_tasks
+
+        if hidden_tasks > 0:
+            st.caption(
+                f"После проверки качества выбрано задач: {total_tasks}. "
+                f"На диаграмме и в списке показано: {visible_tasks}. "
+                f"За пределами выбранного диапазона: {hidden_tasks}."
+            )
+        else:
+            st.caption(
+                f"После проверки качества выбрано задач: {total_tasks}. "
+                "На диаграмме и в списке показаны все выбранные задачи."
+            )
+
+        fig = build_chart(frequency)
+
+        plotly_config = {
+            "displaylogo": False,
+            "scrollZoom": True,
+            "toImageButtonOptions": {
+                "format": "png",
+                "filename": "jira_lead_time_distribution",
+                "height": 800,
+                "width": 1400,
+                "scale": 2,
+            },
+        }
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config=plotly_config,
+        )
+
+        st.caption(
+            "Lead Time рассчитан от Created до Resolved. "
+            "1 день = полные 24 часа. Строки с недостаточными или "
+            "некорректными данными в расчёт не включаются."
+        )
+
+        # -----------------------------
+        # Список задач в расчёте
+        # -----------------------------
+        st.subheader(f"Задачи в текущей выборке — {visible_tasks}")
+
+        st.caption(
+            "Здесь показаны те же задачи, которые участвуют в построении диаграммы. "
+            "Самые долгие задачи расположены сверху."
+        )
+
+        task_table = build_task_table(visible_data)
+
+        st.dataframe(
+            task_table,
+            use_container_width=True,
+            hide_index=True,
+            height=500,
+            column_config={
+                "Название": st.column_config.TextColumn(width="large"),
+                "Ключ": st.column_config.TextColumn(width="small"),
+                "Тип": st.column_config.TextColumn(width="small"),
+                "Статус": st.column_config.TextColumn(width="small"),
+                "Исполнитель": st.column_config.TextColumn(width="medium"),
+                "Создана": st.column_config.TextColumn(width="medium"),
+                "Закрыта": st.column_config.TextColumn(width="medium"),
+                "Lead Time, дней": st.column_config.NumberColumn(
+                    width="small",
+                    format="%d",
+                ),
+            },
+        )
+
+        # -----------------------------
+        # Скачивание PNG
+        # -----------------------------
+        try:
+            png_bytes = fig.to_image(
+                format="png",
+                width=1400,
+                height=800,
+                scale=2,
+            )
+
+            st.download_button(
+                label="Скачать диаграмму PNG",
+                data=png_bytes,
+                file_name="jira_lead_time_distribution.png",
+                mime="image/png",
+                use_container_width=False,
+            )
+
+        except Exception:
+            st.info(
+                "Отдельная кнопка скачивания PNG сейчас недоступна. "
+                "Диаграмму всё равно можно скачать: наведите курсор на график "
+                "и нажмите значок камеры в панели Plotly."
+            )
+
+
+# -----------------------------
+# Исключённые задачи
+# -----------------------------
+if excluded_count > 0:
+    st.subheader(f"Исключённые из Lead Time задачи — {excluded_count}")
     st.caption(
-        f"Выбрано задач: {total_tasks}. "
-        f"На диаграмме и в списке показаны все выбранные задачи."
+        "Эти задачи не участвуют в расчёте Lead Time. "
+        "В последнем столбце указано, какие данные нужно исправить или заполнить."
     )
 
+    excluded_table = build_excluded_table(excluded_data)
 
-fig = build_chart(frequency)
-
-plotly_config = {
-    "displaylogo": False,
-    "scrollZoom": True,
-    "toImageButtonOptions": {
-        "format": "png",
-        "filename": "jira_cycle_time_distribution",
-        "height": 800,
-        "width": 1400,
-        "scale": 2,
-    },
-}
-
-st.plotly_chart(
-    fig,
-    use_container_width=True,
-    config=plotly_config,
-)
-
-st.caption(
-    "Время рассчитано от Created до Resolved. "
-    "1 день = полные 24 часа."
-)
-
-
-# -----------------------------
-# Список задач
-# -----------------------------
-st.subheader(f"Задачи в текущей выборке — {visible_tasks}")
-
-st.caption(
-    "Здесь показаны те же задачи, которые участвуют в построении диаграммы. "
-    "Самые долгие задачи расположены сверху."
-)
-
-task_table = build_task_table(visible_data)
-
-st.dataframe(
-    task_table,
-    use_container_width=True,
-    hide_index=True,
-    height=500,
-    column_config={
-        "Название": st.column_config.TextColumn(width="large"),
-        "Ключ": st.column_config.TextColumn(width="small"),
-        "Тип": st.column_config.TextColumn(width="small"),
-        "Статус": st.column_config.TextColumn(width="small"),
-        "Исполнитель": st.column_config.TextColumn(width="medium"),
-        "Создана": st.column_config.TextColumn(width="medium"),
-        "Закрыта": st.column_config.TextColumn(width="medium"),
-        "Дней до закрытия": st.column_config.NumberColumn(
-            width="small",
-            format="%d",
-        ),
-    },
-)
-
-
-# -----------------------------
-# Скачивание PNG
-# -----------------------------
-try:
-    png_bytes = fig.to_image(
-        format="png",
-        width=1400,
-        height=800,
-        scale=2,
-    )
-
-    st.download_button(
-        label="Скачать диаграмму PNG",
-        data=png_bytes,
-        file_name="jira_cycle_time_distribution.png",
-        mime="image/png",
-        use_container_width=False,
-    )
-
-except Exception:
-    st.info(
-        "Отдельная кнопка скачивания PNG сейчас недоступна. "
-        "Диаграмму всё равно можно скачать: наведите курсор на график "
-        "и нажмите значок камеры в панели Plotly."
+    st.dataframe(
+        excluded_table,
+        use_container_width=True,
+        hide_index=True,
+        height=500,
+        column_config={
+            "Название": st.column_config.TextColumn(width="large"),
+            "Почему исключена": st.column_config.TextColumn(width="large"),
+        },
     )
 
 
 with st.expander("Информация о загруженном файле"):
     st.write(f"Строк в исходном файле: {len(source_df)}")
-    st.write(f"Задач после проверки данных: {len(data)}")
+    st.write(f"Задач для Lead Time после проверки данных: {len(data)}")
+    st.write(f"Исключено из Lead Time: {len(excluded_data)}")
     st.write(f"Определённый разделитель CSV: `{detected_separator}`")
     st.write(f"Определённая кодировка: `{detected_encoding}`")
+    st.write("Колонки в файле:")
+    st.write(list(source_df.columns))
